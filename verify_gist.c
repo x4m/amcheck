@@ -25,6 +25,7 @@
 #include "access/gist_private.h"
 #include "access/htup_details.h"
 #include "access/transam.h"
+#include "bloomfilter.h"
 #include "catalog/index.h"
 #include "catalog/pg_am.h"
 #include "commands/tablecmds.h"
@@ -44,7 +45,7 @@ typedef struct GistScanItem
  * For every tuple on page check if it is contained by tuple on parent page
  */
 static inline void
-gist_check_page_keys(Relation rel, Page parentpage, Page page, IndexTuple parent, GISTSTATE *state)
+gist_check_page_keys(Relation rel, Page parentpage, Page page, IndexTuple parent, GISTSTATE *state, bloom_filter *filter)
 {
 	OffsetNumber i,
 				maxoff = PageGetMaxOffsetNumber(page);
@@ -69,12 +70,17 @@ gist_check_page_keys(Relation rel, Page parentpage, Page page, IndexTuple parent
 					(errcode(ERRCODE_INDEX_CORRUPTED),
 					 errmsg("index \"%s\" has inconsistent records",
 							RelationGetRelationName(rel))));
+		if (filter && GistPageIsLeaf(page) && !ItemIdIsDead(iid))
+		{
+			bloom_add_element(filter, (unsigned char *) idxtuple,
+							  IndexTupleSize(idxtuple));
+		}
 	}
 }
 
 /* Check of an internal page. Hold locks on two pages at a time (parent+child). */
 static inline bool
-gist_check_internal_page(Relation rel, Page page, BufferAccessStrategy strategy, GISTSTATE *state)
+gist_check_internal_page(Relation rel, Page page, BufferAccessStrategy strategy, GISTSTATE *state, bloom_filter *filter)
 {
 	bool has_leafs = false;
 	bool has_internals = false;
@@ -106,7 +112,7 @@ gist_check_internal_page(Relation rel, Page page, BufferAccessStrategy strategy,
 
 		has_leafs = has_leafs || GistPageIsLeaf(child_page);
 		has_internals = has_internals || !GistPageIsLeaf(child_page);
-		gist_check_page_keys(rel, page, child_page, idxtuple, state);
+		gist_check_page_keys(rel, page, child_page, idxtuple, state, filter);
 
 		UnlockReleaseBuffer(buffer);
 	}
@@ -153,10 +159,11 @@ pushStackIfSplited(Page page, GistScanItem *stack)
  * through GiST graph.
  */
 static inline void
-gist_check_keys_consistency(Relation rel)
+gist_check_keys_consistency(Relation rel, bool heapallindexed)
 {
 	GistScanItem *stack,
 			   *ptr;
+	bloom_filter *filter = NULL;
 	
 	BufferAccessStrategy strategy = GetAccessStrategy(BAS_BULKREAD);
 
@@ -172,6 +179,19 @@ gist_check_keys_consistency(Relation rel)
 
 	MemoryContext oldcontext = MemoryContextSwitchTo(mctx);
 	GISTSTATE *state = initGISTstate(rel);
+
+	if (heapallindexed)
+	{
+		int64	total_elems;
+		uint32	seed;
+
+		/* Size Bloom filter based on estimated number of tuples in index */
+		total_elems = (int64) rel->rd_rel->reltuples;
+		/* Random seed relies on backend srandom() call to avoid repetition */
+		seed = random();
+		/* Create Bloom filter to fingerprint index */
+		filter = bloom_create(total_elems, maintenance_work_mem, seed);
+	}
 
 	stack = (GistScanItem *) palloc0(sizeof(GistScanItem));
 	stack->blkno = GIST_ROOT_BLKNO;
@@ -203,7 +223,7 @@ gist_check_keys_consistency(Relation rel)
 
 			maxoff = PageGetMaxOffsetNumber(page);
 
-			if (gist_check_internal_page(rel, page, strategy, state))
+			if (gist_check_internal_page(rel, page, strategy, state, filter))
 			{
 				for (i = FirstOffsetNumber; i <= maxoff; i = OffsetNumberNext(i))
 				{
@@ -264,10 +284,15 @@ gist_index_check_next(PG_FUNCTION_ARGS)
 {
 	Oid			indrelid = PG_GETARG_OID(0);
 	Relation	indrel;
+	bool		heapallindexed = false;
+
+	if (PG_NARGS() == 2)
+		heapallindexed = PG_GETARG_BOOL(1);
+
 	indrel = index_open(indrelid, ShareLock);
 
 	gist_index_checkable(indrel);
-	gist_check_keys_consistency(indrel);		
+	gist_check_keys_consistency(indrel, heapallindexed);		
 
 	index_close(indrel, ShareLock);
 

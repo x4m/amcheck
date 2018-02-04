@@ -6,9 +6,10 @@
 --
 -- gist_index_check()
 --
-CREATE FUNCTION gist_index_check(index regclass)
+CREATE FUNCTION gist_index_check(index regclass,
+    heapallindexed boolean DEFAULT false)
 RETURNS VOID
 AS 'MODULE_PATHNAME', 'gist_index_check_next'
 LANGUAGE C STRICT;
 
-REVOKE ALL ON FUNCTION gist_index_check(regclass) FROM PUBLIC;
+REVOKE ALL ON FUNCTION gist_index_check(regclass, boolean) FROM PUBLIC;

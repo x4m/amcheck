@@ -24,7 +24,8 @@ LANGUAGE C STRICT;
 --
 -- gist_index_check()
 --
-CREATE FUNCTION gist_index_check(index regclass)
+CREATE FUNCTION gist_index_check(index regclass,
+    heapallindexed boolean DEFAULT false)
 RETURNS VOID
 AS 'MODULE_PATHNAME', 'gist_index_check_next'
 LANGUAGE C STRICT;
@@ -32,4 +33,4 @@ LANGUAGE C STRICT;
 -- Don't want these to be available to public
 REVOKE ALL ON FUNCTION bt_index_check(regclass, boolean) FROM PUBLIC;
 REVOKE ALL ON FUNCTION bt_index_parent_check(regclass, boolean) FROM PUBLIC;
-REVOKE ALL ON FUNCTION gist_index_check(regclass) FROM PUBLIC;
+REVOKE ALL ON FUNCTION gist_index_check(regclass, boolean) FROM PUBLIC;
