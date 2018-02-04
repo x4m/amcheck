@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  *
- * verify_nbtree.c
+ * verify_gist.c
  *		Verifies the integrity of GiST indexes based on invariants.
  *
  * Verification checks that all paths in GiST graph are contatining
@@ -41,6 +41,45 @@ typedef struct GistScanItem
 	struct GistScanItem *next;
 } GistScanItem;
 
+typedef struct GistCheckState
+{
+	/*
+	 * Unchanging state, established at start of verification:
+	 */
+
+	/* B-Tree Index Relation and associated heap relation */
+	Relation	rel;
+	Relation	heaprel;
+	/* ShareLock held on heap/index, rather than AccessShareLock? */
+	bool		readonly;
+	/* Also verifying heap has no unindexed tuples? */
+	bool		heapallindexed;
+	/* Per-page context */
+	MemoryContext targetcontext;
+	/* Buffer access strategy */
+	BufferAccessStrategy checkstrategy;
+
+	/*
+	 * Mutable state, for verification of particular page:
+	 */
+
+	/* Current target page */
+	Page		target;
+	/* Target block number */
+	BlockNumber targetblock;
+	/* Target page's LSN */
+	XLogRecPtr	targetlsn;
+
+	/*
+	 * Mutable state, for optional heapallindexed verification:
+	 */
+
+	/* Bloom filter fingerprints B-Tree index */
+	bloom_filter *filter;
+	/* Debug counter */
+	int64		heaptuplespresent;
+} GistCheckState;
+
 /*
  * For every tuple on page check if it is contained by tuple on parent page
  */
@@ -72,6 +111,7 @@ gist_check_page_keys(Relation rel, Page parentpage, Page page, IndexTuple parent
 							RelationGetRelationName(rel))));
 		if (filter && GistPageIsLeaf(page) && !ItemIdIsDead(iid))
 		{
+		elog(NOTICE,"AM: addelement");
 			bloom_add_element(filter, (unsigned char *) idxtuple,
 							  IndexTupleSize(idxtuple));
 		}
@@ -154,6 +194,76 @@ pushStackIfSplited(Page page, GistScanItem *stack)
 	}
 }
 
+static void
+gist_tuple_present_callback(Relation index, HeapTuple htup, Datum *values,
+						  bool *isnull, bool tupleIsAlive, void *checkstate)
+{
+	GistCheckState *state = (GistCheckState *) checkstate;
+	IndexTuple		 itup;
+
+	Assert(state->heapallindexed);
+
+	/* Must recheck visibility when only AccessShareLock held */
+	if (!state->readonly)
+	{
+		TransactionId	xmin;
+
+		/*
+		 * Don't test for presence in index where xmin not at least old enough
+		 * that we know for sure that absence of index tuple wasn't just due to
+		 * some transaction performing insertion after our verifying index
+		 * traversal began.  (Actually, the cut-off used is a point where
+		 * preceding write transactions must have committed/aborted.  We should
+		 * have already fingerprinted all index tuples for all such preceding
+		 * transactions, because the cut-off was established before our index
+		 * traversal even began.)
+		 *
+		 * You might think that the fact that an MVCC snapshot is used by the
+		 * heap scan (due to our indicating that this is the first scan of a
+		 * CREATE INDEX CONCURRENTLY index build) would make this test
+		 * redundant.  That's not quite true, because with current
+		 * IndexBuildHeapScan() interface caller cannot do the MVCC snapshot
+		 * acquisition itself.  Heap tuple coverage is thereby similar to the
+		 * coverage we could get by using earliest transaction snapshot
+		 * directly.  It's easier to do this than to adopt the
+		 * IndexBuildHeapScan() interface to our narrow requirements.
+		 */
+		Assert(tupleIsAlive);
+		xmin = HeapTupleHeaderGetXmin(htup->t_data);
+		if (!TransactionIdPrecedes(xmin, TransactionXmin))
+			return;
+	}
+
+	/*
+	 * Generate an index tuple.
+	 *
+	 * Note that we rely on deterministic index_form_tuple() TOAST compression.
+	 * If index_form_tuple() was ever enhanced to compress datums out-of-line,
+	 * or otherwise varied when or how compression was applied, our assumption
+	 * would break, leading to false positive reports of corruption.  For now,
+	 * we don't decompress/normalize toasted values as part of fingerprinting.
+	 */
+	itup = index_form_tuple(RelationGetDescr(index), values, isnull);
+	itup->t_tid = htup->t_self;
+
+	/* Probe Bloom filter -- tuple should be present */
+	if (bloom_lacks_element(state->filter, (unsigned char *) itup,
+							IndexTupleSize(itup)))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("heap tuple (%u,%u) from table \"%s\" lacks matching index tuple within index \"%s\"",
+						ItemPointerGetBlockNumber(&(itup->t_tid)),
+						ItemPointerGetOffsetNumber(&(itup->t_tid)),
+						RelationGetRelationName(state->heaprel),
+						RelationGetRelationName(state->rel)),
+				 !state->readonly
+				 ? errhint("Retrying verification using the function bt_index_parent_check() might provide a more specific error.")
+				 : 0));
+
+	state->heaptuplespresent++;
+	pfree(itup);
+}
+
 /* 
  * Main entry point for GiST check. Allocates memory context and scans 
  * through GiST graph.
@@ -163,6 +273,7 @@ gist_check_keys_consistency(Relation rel, bool heapallindexed)
 {
 	GistScanItem *stack,
 			   *ptr;
+	Relation	heaprel;
 	bloom_filter *filter = NULL;
 	
 	BufferAccessStrategy strategy = GetAccessStrategy(BAS_BULKREAD);
@@ -191,6 +302,8 @@ gist_check_keys_consistency(Relation rel, bool heapallindexed)
 		seed = random();
 		/* Create Bloom filter to fingerprint index */
 		filter = bloom_create(total_elems, maintenance_work_mem, seed);
+		
+		heaprel = heap_open(IndexGetRelation(rel->rd_id, true), AccessShareLock);
 	}
 
 	stack = (GistScanItem *) palloc0(sizeof(GistScanItem));
@@ -244,6 +357,38 @@ gist_check_keys_consistency(Relation rel, bool heapallindexed)
 		ptr = stack->next;
 		pfree(stack);
 		stack = ptr;
+	}
+
+	if (heapallindexed)
+	{
+		IndexInfo  *indexinfo;
+		GistCheckState state;
+		state.filter = filter;
+		state.heapallindexed = true;
+		state.rel = rel;
+		state.heaprel = heaprel;
+
+		indexinfo = BuildIndexInfo(rel);
+
+		indexinfo->ii_Concurrent = true;
+		
+		indexinfo->ii_Unique = false;
+		indexinfo->ii_ExclusionOps = NULL;
+		indexinfo->ii_ExclusionProcs = NULL;
+		indexinfo->ii_ExclusionStrats = NULL;
+
+		IndexBuildHeapScan(heaprel, rel, indexinfo, true,
+						   gist_tuple_present_callback, (void *) &state);
+
+		ereport(DEBUG1,
+				(errmsg_internal("finished verifying presence of " INT64_FORMAT " tuples (proportion of bits set: %f) from table \"%s\"",
+								 state.heaptuplespresent, bloom_prop_bits_set(state.filter),
+								 RelationGetRelationName(heaprel))));
+
+		bloom_free(filter);
+
+		if (heaprel)
+			heap_close(heaprel, AccessShareLock);
 	}
 
     MemoryContextSwitchTo(oldcontext);
