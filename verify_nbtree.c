@@ -119,12 +119,12 @@ PG_FUNCTION_INFO_V1(bt_index_check_next);
 PG_FUNCTION_INFO_V1(bt_index_parent_check_next);
 
 static void bt_index_check_internal(Oid indrelid, bool parentcheck,
-						bool heapallindexed);
+						bool heapallindexed, bool optimistic);
 static inline void btree_index_checkable(Relation rel);
 static void bt_check_every_level(Relation rel, Relation heaprel,
-					 bool readonly, bool heapallindexed);
+					 bool readonly, bool heapallindexed, bool optimistic);
 static BtreeLevel bt_check_level_from_leftmost(BtreeCheckState *state,
-							 BtreeLevel level);
+							 BtreeLevel level, bool optimistic);
 static void bt_target_page_check(BtreeCheckState *state);
 static ScanKey bt_right_page_check_scankey(BtreeCheckState *state);
 static void bt_downlink_check(BtreeCheckState *state, BlockNumber childblock,
@@ -166,11 +166,14 @@ bt_index_check_next(PG_FUNCTION_ARGS)
 {
 	Oid			indrelid = PG_GETARG_OID(0);
 	bool		heapallindexed = false;
+	bool		optimistic = false;
 
 	if (PG_NARGS() == 2)
 		heapallindexed = PG_GETARG_BOOL(1);
+	if (PG_NARGS() == 3)
+		optimistic = PG_GETARG_BOOL(2);
 
-	bt_index_check_internal(indrelid, false, heapallindexed);
+	bt_index_check_internal(indrelid, false, heapallindexed, optimistic);
 
 	PG_RETURN_VOID();
 }
@@ -192,11 +195,15 @@ bt_index_parent_check_next(PG_FUNCTION_ARGS)
 {
 	Oid			indrelid = PG_GETARG_OID(0);
 	bool		heapallindexed = false;
+	bool		optimistic = false;
 
 	if (PG_NARGS() == 2)
 		heapallindexed = PG_GETARG_BOOL(1);
 
-	bt_index_check_internal(indrelid, true, heapallindexed);
+	if (PG_NARGS() == 3)
+		heapallindexed = PG_GETARG_BOOL(2);
+
+	bt_index_check_internal(indrelid, true, heapallindexed, optimistic);
 
 	PG_RETURN_VOID();
 }
@@ -205,7 +212,7 @@ bt_index_parent_check_next(PG_FUNCTION_ARGS)
  * Helper for bt_index_[parent_]check, coordinating the bulk of the work.
  */
 static void
-bt_index_check_internal(Oid indrelid, bool parentcheck, bool heapallindexed)
+bt_index_check_internal(Oid indrelid, bool parentcheck, bool heapallindexed, bool optimistic)
 {
 	Oid			heapid;
 	Relation	indrel;
@@ -260,7 +267,7 @@ bt_index_check_internal(Oid indrelid, bool parentcheck, bool heapallindexed)
 	btree_index_checkable(indrel);
 
 	/* Check index, possibly against table it is an index on */
-	bt_check_every_level(indrel, heaprel, parentcheck, heapallindexed);
+	bt_check_every_level(indrel, heaprel, parentcheck, heapallindexed, optimistic);
 
 	/*
 	 * Release locks early. That's ok here because nothing in the called
@@ -331,7 +338,7 @@ btree_index_checkable(Relation rel)
  */
 static void
 bt_check_every_level(Relation rel, Relation heaprel, bool readonly,
-					 bool heapallindexed)
+					 bool heapallindexed, bool optimistic)
 {
 	BtreeCheckState *state;
 	Page		metapage;
@@ -462,7 +469,7 @@ bt_check_every_level(Relation rel, Relation heaprel, bool readonly,
 		 * Verify this level, and get left most page for next level down, if
 		 * not at leaf level
 		 */
-		current = bt_check_level_from_leftmost(state, current);
+		current = bt_check_level_from_leftmost(state, current, optimistic);
 
 		if (current.leftmost == InvalidBlockNumber)
 			ereport(ERROR,
@@ -555,7 +562,7 @@ bt_check_every_level(Relation rel, Relation heaprel, bool readonly,
  * each call to bt_target_page_check().
  */
 static BtreeLevel
-bt_check_level_from_leftmost(BtreeCheckState *state, BtreeLevel level)
+bt_check_level_from_leftmost(BtreeCheckState *state, BtreeLevel level, bool optimistic)
 {
 	/* State to establish early, concerning entire level */
 	BTPageOpaque opaque;
@@ -690,7 +697,7 @@ bt_check_level_from_leftmost(BtreeCheckState *state, BtreeLevel level)
 		 * readonly mode can only ever land on live pages and half-dead pages,
 		 * so sibling pointers should always be in mutual agreement
 		 */
-		if (state->readonly && opaque->btpo_prev != leftcurrent)
+		if ((state->readonly || optimistic) && opaque->btpo_prev != leftcurrent)
 			ereport(ERROR,
 					(errcode(ERRCODE_INDEX_CORRUPTED),
 					 errmsg("left link/right link pair in index \"%s\" not in agreement",
